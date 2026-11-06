@@ -1,0 +1,1232 @@
+﻿using System.Buffers.Binary;
+using System.Diagnostics;
+using System.Globalization;
+using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading.Channels;
+using System.Xml.Linq;
+using System.Xml.XPath;
+
+namespace SPRDClientCore.Utils
+{
+    public partial class SprdFlashUtils
+    {
+        private IProtocolHandler handler;
+        private long nowBytes = 0;
+        private static bool isSprd4AfterChangeDiagMode = false;
+        public event Action<string>? Log;
+        public event Action<int>? UpdatePercentage;
+        public event Action<string>? UpdateStatus;
+        public ushort PerBlockSize { get; set; } = 0xfe00;
+        public int Timeout { get => handler.Timeout; set => handler.Timeout = value; }
+        public double Percentage { get; set; } = 100d;
+        public bool Verbose { get => handler.Verbose; set => handler.Verbose = value; }
+        public IProtocolHandler Handler { get => handler; }
+        public SprdFlashUtils(IProtocolHandler handler, Action<string>? log = null, Action<int>? updatePercentage = null, Action<string>? logSpeed = null)
+        {
+            this.handler = handler;
+            Log = log;
+            UpdatePercentage = updatePercentage;
+            UpdateStatus = logSpeed;
+        }
+        public void PowerOnDevice()
+        {
+            handler.SendPacketAndReceive(BSL_CMD_NORMAL_RESET);
+        }
+        public void ShutdownDevice()
+        {
+            handler.SendPacketAndReceive(BSL_CMD_POWER_OFF);
+        }
+        public bool SetBootloaderLockStatus(bool lockStatus)
+        {
+            return handler.SendPacketAndReceive(lockStatus ? YCC_CMD_LOCK_BOOTLOADER : YCC_CMD_UNLOCK_BOOTLOADER).Type == YCC_REP_SET_BOOTLOADER_SUCCESS;
+        }
+        public void ResetToCustomMode(CustomModesToReset mode)
+        {
+            if (!CheckPartitionExist("misc")) return;
+            using (MemoryStream ms = new MemoryStream())
+            {
+                byte[] data = Encoding.ASCII.GetBytes("boot-recovery");
+                ms.Write(data, 0, data.Length);
+                ms.Position = 0x40;
+                ms.Write(mode switch
+                {
+                    CustomModesToReset.FactoryReset => Encoding.ASCII.GetBytes("recovery\n--wipe_data\n"),
+                    CustomModesToReset.Fastboot => Encoding.ASCII.GetBytes("recovery\n--fastboot\n"),
+                    _ => new byte[] { 0 }
+                });
+                ms.SetLength(0x800);
+                WritePartition("misc", ms.ToArray(), 0);
+            }
+        }
+        public void SetActiveSlot(SlotToSetActive slot)
+        {
+            if (!CheckPartitionExist("misc")) return;
+            WritePartition("misc", slot switch
+            {
+                SlotToSetActive.SlotA => PayloadOfSlotA,
+                SlotToSetActive.SlotB => PayloadOfSlotB,
+                _ => throw new ArgumentOutOfRangeException(slot.ToString(), "Unknown partition slot")
+            }, 0x800);
+        }
+        public void SetDmVerityStatus(bool status, List<Partition> partitions)
+        {
+            if (!CheckPartitionExist("vbmeta")) return;
+            byte[] disableByte = { 1 };
+            byte[] enableByte = { 0 };
+            WritePartitionWithoutVerify("vbmeta", partitions, status ? enableByte : disableByte, 0x7B);
+            Log?.Invoke(status ? "DM-verity enabled" : "DM-verity disabled");
+        }
+        public (Stages SprdMode, Stages Stage) ConnectToDevice(bool isReconnected = false)
+        {
+            var origTimeout = Timeout;
+            if (!isReconnected) Timeout = 500;
+            Packet packet;
+
+            // Stage witness: ONLY the BROM answers CHECK_BAUD with BSL_REP_VER.
+            // FDL1/FDL2 either ignore it (timeout) or reject it (VERIFY_ERROR).
+            // Never infer the stage from UseCrc: that flag auto-flips to CRC as
+            // soon as the loader answers, so a live FDL1 was being reported as
+            // BROM flow gave up with "no loader takeover".
+            bool bromWitness = false;
+            try
+            {
+                packet = handler.SendPacketAndReceive(isReconnected ? BSL_CMD_CONNECT : BSL_CMD_CHECK_BAUD);
+                bromWitness = !isReconnected && packet.Type == BSL_REP_VER;
+            }
+            catch (ResponseTimeoutReachedException)
+            {
+                if(!isReconnected)
+                {
+                    Log?.Invoke("Attempting to reconnect device");
+                    packet = handler.SendPacketAndReceive(BSL_CMD_CONNECT);
+                }
+                else
+                {
+                    throw;
+                }
+            }
+            Log?.Invoke("Attempting to send handshake packet");
+            Timeout = origTimeout;
+            Stages stage = bromWitness ? Stages.Brom : Stages.Fdl1;
+            switch (packet.Type)
+            {
+                default: throw new UnexpectedResponseException(packet.Type);
+                case BSL_REP_UNSUPPORTED_COMMAND:
+                    Log?.Invoke("Handshaked with fdl2");
+                    handler.Transcode = false;
+                    handler.SendPacketAndReceive(BSL_CMD_DISABLE_TRANSCODE);
+                    Log?.Invoke("Attempted to cancel 0x7d encoding");
+                    return (Stages.Sprd3, Stages.Fdl2);
+                case BSL_REP_VERIFY_ERROR:
+                    Log?.Invoke("Verification failed");
+                    handler.SendPacketAndReceive(BSL_CMD_CONNECT);
+                    Log?.Invoke($"Attempting to re-handshake with {stage}");
+                    return (Stages.Sprd3, stage);
+                case BSL_REP_VER:
+                    if (!isReconnected) handler.SendPacketAndReceive(BSL_CMD_CONNECT);
+                    Log?.Invoke($"Attempting handshake with {stage}");
+                    return (Encoding.ASCII.GetString(packet.Data).ToLower().Contains("autod") ? Stages.Sprd4 : Stages.Sprd3, stage);
+                case BSL_REP_ACK:
+                    Log?.Invoke($"Attempting handshake with {stage}");
+                    var result = (isSprd4AfterChangeDiagMode ? Stages.Sprd4 : Stages.Sprd3, stage);
+                    isSprd4AfterChangeDiagMode = false;
+                    return result;
+
+            }
+            throw new ResponseTimeoutReachedException("Response timeout");
+        }
+        [SupportedOSPlatform("windows")]
+        public static SprdProtocolHandler ChangeDiagnosticMode(Action<string>? log = null, Action<string>? notify = null, MethodOfChangingDiagnostic mode = MethodOfChangingDiagnostic.CommonMode, ModeToChange modeTo = ModeToChange.DlDiagnostic)
+        {
+            var handler = new SprdProtocolHandler(new HdlcEncoder());
+            ChangeDiagnosticMode(handler);
+            return handler;
+        }
+        [SupportedOSPlatform("windows")]
+        public static void ChangeDiagnosticMode(SprdProtocolHandler sprdProtocolHandler, Action<string>? log = null, Action<string>? notify = null, MethodOfChangingDiagnostic mode = MethodOfChangingDiagnostic.CommonMode, ModeToChange modeTo = ModeToChange.DlDiagnostic)
+        {
+            byte[] firstPacket = { 0x7e, 0, 0, 0, 0, 8, 0, 0xfe, 0, 0x7e };
+            byte[] autodloaderPacket = { 0x7e, 0, 0, 0, 0, 0x20, 0,
+                0x68, 0, 0x41, 0x54, 0x2b, 0x53, 0x50, 0x52, 0x45
+                , 0x46, 0x3d, 0x22, 0x41, 0x55, 0x54, 0x4f,
+                0x44, 0x4c, 0x4f, 0x41, 0x44, 0x45, 0x52, 0x22,
+                0xd, 0xa, 0x7e };
+            bool isInDownloadMode(byte[] bytesReceived) => bytesReceived[2] == (byte)BSL_REP_VER || bytesReceived[2] == (byte)BSL_REP_VERIFY_ERROR || bytesReceived[2] == (byte)BSL_REP_UNSUPPORTED_COMMAND && bytesReceived[2] != (byte)BSL_CMD_CHECK_BAUD;
+            bool isDeviceConnected = sprdProtocolHandler.IsPortOpen;
+            ComPortMonitor monitor = new(
+                isDeviceConnected ? sprdProtocolHandler.PortName : "", () => isDeviceConnected = false);
+            Action waitForDeviceDisconnecting = () =>
+            {
+                while (isDeviceConnected) continue;
+                //   sprdProtocolHandler.TryDisconnectChannel();
+                log?.Invoke("Waiting for device connection");
+            };
+            Action connectToDevice = () =>
+            {
+                monitor.Stop();
+                string port = SprdProtocolHandler.FindComPort("SPRD U2S DIAG");
+                sprdProtocolHandler.TryConnectChannel(port);
+                notify?.Invoke($"Successfully connected to port {port}");
+                monitor = new(port, () => isDeviceConnected = false);
+                isDeviceConnected = true;
+            };
+            if (!isDeviceConnected)
+                connectToDevice();
+            switch (mode)
+            {
+                case MethodOfChangingDiagnostic.CommonMode:
+                    firstPacket[8] = 0x82;
+                    break;
+                case MethodOfChangingDiagnostic.CustomOneTimeMode:
+                    firstPacket[8] = (byte)(0x80 + (ushort)modeTo);
+                    break;
+            }
+            log?.Invoke($"Attempting to send 0x{firstPacket[8]:x} packet");
+            byte[] bytesReceived = sprdProtocolHandler.SendBytesAndReceiveBytes(firstPacket);
+            if (bytesReceived.Length >= 6 && isInDownloadMode(bytesReceived))
+            {
+                monitor.Stop();
+                return;
+            }
+
+            waitForDeviceDisconnecting();
+            connectToDevice();
+
+            var temp = sprdProtocolHandler.UseCrc;
+            sprdProtocolHandler.UseCrc = true;
+            if (mode != MethodOfChangingDiagnostic.CustomOneTimeMode)
+                try
+                {
+                    if ((bytesReceived = sprdProtocolHandler.SendPacketAndReceiveBytes(BSL_CMD_CONNECT, Array.Empty<byte>())).Length >= 6 && isInDownloadMode(bytesReceived))
+                    {
+                        isSprd4AfterChangeDiagMode = bytesReceived[2] == (byte)BSL_REP_VER && Encoding.ASCII.GetString(bytesReceived.AsSpan(5, bytesReceived.Length - 8)).ToLower().Contains("autod");
+                        monitor.Stop();
+                        return;
+                    }
+                }
+                catch (TimeoutException)
+                {
+
+                }
+            sprdProtocolHandler.UseCrc = temp;
+
+            if (modeTo == ModeToChange.DlDiagnostic && mode == MethodOfChangingDiagnostic.CommonMode)
+            {
+                log?.Invoke($"Attempting to send autod packet");
+                bytesReceived = sprdProtocolHandler.SendBytesAndReceiveBytes(autodloaderPacket);
+                waitForDeviceDisconnecting();
+                connectToDevice();
+            }
+            monitor.Stop();
+        }
+        public void SendFile(Stream fileData, uint startAddress, uint perBlockSize = 528, bool sendEndData = true)
+        {
+            long totalSize = fileData.Length;
+            byte[] header = new byte[8];
+            byte[] buffer = new byte[0xffff];
+            SprdCommand response;
+            BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(0, 4), startAddress);
+            BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(4, 4), (uint)totalSize);
+            if ((response = handler.SendPacketAndReceive(BSL_CMD_START_DATA, header).Type) != BSL_REP_ACK)
+                throw new UnexpectedResponseException(response);
+
+            bool oldVerbose = handler.Verbose;
+            long n = 0;
+            for (uint offset = 0; offset < totalSize; offset += perBlockSize)
+            {
+                n = totalSize - offset;
+                if (n > perBlockSize) n = perBlockSize;
+                fileData.Position = offset;
+                fileData.ReadExactly(buffer, 0, (int)n);
+                response = handler.SendPacketAndReceive(BSL_CMD_MIDST_DATA, buffer.AsMemory(0, (int)n)).Type;
+                if (response != BSL_REP_ACK)
+                {
+                    throw new UnexpectedResponseException(response);
+                }
+
+                UpdatePercentage?.Invoke((int)((float)(offset + n) / totalSize * Percentage));
+            }
+            handler.Verbose = oldVerbose;
+            if (sendEndData)
+            {
+                response = handler.SendPacketAndReceive(BSL_CMD_END_DATA).Type;
+                if (response != BSL_REP_ACK)
+                {
+                    throw new UnexpectedResponseException(response);
+                }
+            }
+            Log?.Invoke($"Successfully sent file to 0x{startAddress:X8}");
+        }
+        public bool CheckPartitionExist(string partName)
+        {
+            if (string.IsNullOrWhiteSpace(partName))
+                return false;
+            var receiveType = handler.SendPacketAndReceive(BSL_CMD_READ_START, CreateSelectPartitionRequest(partName, 0x8)).Type;
+            if (receiveType == BSL_REP_ACK)
+            {
+                uint[] temp = { 0x8, 0 };
+                byte[] tempData = new byte[temp.Length * sizeof(uint)];
+                Buffer.BlockCopy(temp, 0, tempData, 0, tempData.Length);
+                receiveType = handler.SendPacketAndReceive(BSL_CMD_READ_MIDST, tempData).Type;
+                handler.SendPacketAndReceive(BSL_CMD_READ_END);
+                return receiveType == BSL_REP_READ_FLASH;
+            }
+            else
+            {
+                handler.SendPacketAndReceive(BSL_CMD_READ_END);
+                return false;
+            }
+        }
+        private Task StartStatusMonitor(int intervalMs, ulong size, CancellationToken? cancellation = null)
+        {
+            return Task.Run(async () =>
+            {
+                var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(intervalMs));
+                long lastBytes = nowBytes;
+                DateTime lastTime = DateTime.UtcNow;
+                while (await timer.WaitForNextTickAsync())
+                {
+                    if (cancellation?.IsCancellationRequested == true)
+                    {
+                        UpdateStatus?.Invoke("");
+                        nowBytes = 0;
+                        cancellation?.ThrowIfCancellationRequested();
+                    }
+                    DateTime now = DateTime.UtcNow;
+                    double speed = (nowBytes - lastBytes) / (now - lastTime).TotalSeconds;
+                    lastTime = now;
+                    UpdateStatus?.Invoke($"Speed: {speed / 1024 / 1024.0:N2} MB/s, Completed: {nowBytes / 1024 / 1024.0:N2}MB / {size / 1024 / 1024.0:N2}MB, Remaining time: {(speed != 0 ? ((size - (ulong)nowBytes) / speed).ToString("n2") : "inf")}s");
+                    lastBytes = nowBytes;
+                }
+            });
+        }
+        #region Writing partition
+        public void WritePartition(string partName, Stream data, ulong offset)
+        {
+            byte[] buffer = new byte[data.Length];
+            data.ReadExactly(buffer, 0, buffer.Length);
+            WritePartition(partName, buffer, offset);
+        }
+        public void WritePartition(string partName, byte[] data, ulong offset)
+        {
+            if (!CheckPartitionExist(partName)) return;
+            using (MemoryStream ms = new())
+            {
+                ReadPartitionCustomize(ms, partName, GetPartitionSize(partName));
+                if (ms == null) return;
+                ms.Position = (long)offset;
+                ms.Write(data, 0, data.Length);
+                ms.Position = 0;
+                WritePartition(partName, ms);
+            }
+
+        }
+        public void WritePartition(string partName, Stream data)
+        {
+            CancellationTokenSource cts = new CancellationTokenSource();
+            byte[] buffer = new byte[0xffff];
+            try
+            {
+                if (partName.Contains("runtimenv"))
+                { ErasePartition(partName); return; }
+                if (partName.Contains("calinv")) return;
+                Log?.Invoke($"Start writing {partName} partition");
+                if (partName.Contains("fixnv1"))
+                {
+                    uint offset = 0;
+                    uint length = 4;
+                    byte[] dataBytes = new byte[data.Length];
+                    data.ReadExactly(dataBytes, 0, dataBytes.Length);
+                    if (dataBytes.Length >= 4 && BitConverter.ToUInt32(dataBytes, 0) == 0x4e56)
+                    {
+                        offset += 0x200;
+                    }
+                    ushort[] _temp = { 0, 0 };
+                    while (true)
+                    {
+                        _temp[0] = BitConverter.ToUInt16(dataBytes, (int)(offset + length));
+                        _temp[1] = BitConverter.ToUInt16(dataBytes, (int)(offset + length + sizeof(ushort)));
+                        if (_temp[1] == 0) throw new Exception("Corrupted NV file");
+                        length += _temp[1] + sizeof(ushort) * (uint)_temp.Length;
+                        uint tempOffset = (length + 3 & 0xFFFFFFFC) - length;
+                        length += tempOffset;
+                        _temp[0] = BitConverter.ToUInt16(dataBytes, (int)(offset + length));
+                        if (_temp[0] == 0xffff)
+                        {
+                            length += 8;
+                            break;
+                        }
+                    }
+                    byte[] tempBytes = new byte[length - sizeof(ushort)];
+                    Buffer.BlockCopy(dataBytes, (int)offset + 2, tempBytes, 0, tempBytes.Length);
+                    byte[] crc = BitConverter.GetBytes(new Crc16NvChecksum().Compute(tempBytes));
+                    Array.Reverse(crc);
+                    Buffer.BlockCopy(crc, 0, dataBytes, (int)offset, crc.Length);
+                    byte[] startData = new byte[36 * sizeof(char) + 2 * sizeof(uint)];
+                    Buffer.BlockCopy(Encoding.Unicode.GetBytes(partName), 0, startData, 0, partName.Length * sizeof(char));
+                    Buffer.BlockCopy(BitConverter.GetBytes(length), 0, startData, 36 * sizeof(char), sizeof(int));
+                    uint checksum = 0;
+                    for (int i = (int)offset; i < offset + length; i++)
+                        checksum += dataBytes[i];
+                    Buffer.BlockCopy(BitConverter.GetBytes(checksum), 0, startData, 36 * sizeof(char) + sizeof(int), sizeof(int));
+                    Packet packet = handler.SendPacketAndReceive(BSL_CMD_START_DATA, startData);
+                    if (packet.Type != BSL_REP_ACK) throw new UnexpectedResponseException(packet.Type);
+                    for (uint nowOffset = 0; nowOffset < length;)
+                    {
+                        uint nowSize = Math.Min(PerBlockSize, length - nowOffset);
+                        byte[] block = new byte[nowSize];
+                        Buffer.BlockCopy(dataBytes, (int)nowOffset, block, 0, block.Length);
+                        packet = handler.SendPacketAndReceive(BSL_CMD_MIDST_DATA, block);
+                        if (packet.Type != BSL_REP_ACK)
+                            throw new UnexpectedResponseException(packet.Type);
+                        nowOffset += nowSize;
+                        UpdatePercentage?.Invoke((int)(nowOffset / (float)length * Percentage));
+                    }
+                    packet = handler.SendPacketAndReceive(BSL_CMD_END_DATA);
+                    if (packet.Type != BSL_REP_ACK)
+                        throw new UnexpectedResponseException(packet.Type);
+
+                    return;
+                }
+                ulong dataLength = (ulong)data.Length;
+                var temp = handler.SendPacketAndReceive(BSL_CMD_START_DATA, CreateSelectPartitionRequest(partName, dataLength)).Type;
+                if (temp != BSL_REP_ACK) throw new UnexpectedResponseException(temp);
+                StartStatusMonitor(1000, dataLength, cts.Token);
+                for (ulong nowOffset = 0; nowOffset < dataLength;)
+                {
+                    ulong nowSize = Math.Min(PerBlockSize, dataLength - nowOffset);
+                    data.Position = (long)nowOffset;
+                    data.ReadExactly(buffer, 0, (int)nowSize);
+                    //Buffer.BlockCopy(data., (int)nowOffset, chunk, 0, (int)nowSize);
+                    temp = handler.SendPacketAndReceive(BSL_CMD_MIDST_DATA, buffer.AsMemory(0, (int)nowSize)).Type;
+                    if (temp != BSL_REP_ACK)
+                        throw new UnexpectedResponseException(temp);
+                    nowBytes += (long)nowSize;
+                    nowOffset += nowSize;
+                    UpdatePercentage?.Invoke((int)(nowOffset / (float)dataLength * Percentage));
+                }
+                var __temp = handler.SendPacketAndReceive(BSL_CMD_END_DATA).Type;
+                if (__temp != BSL_REP_ACK)
+                    throw new UnexpectedResponseException(__temp);
+            }
+            finally
+            {
+                cts.Cancel();
+                data.Dispose();
+                Log?.Invoke($"{partName} partition write complete");
+            }
+        }
+        public async Task WritePartitionAsync(string partName, Stream data, CancellationToken token)
+        {
+            CancellationTokenSource cts = CancellationTokenSource.CreateLinkedTokenSource(token);
+            token = cts.Token;
+            Task? sendAndReceiveTask = null;
+            Task? sendTask = null;
+
+            ushort blocksize = PerBlockSize;
+            ulong dataLength = (ulong)data.Length;
+            bool use64Mode = dataLength >> 32 != 0;
+
+            var StatusMonitor = StartStatusMonitor(500, dataLength, token);
+
+            Channel<Packet> sendChannel = Channel.CreateBounded<Packet>(new BoundedChannelOptions(20) { SingleReader = true, SingleWriter = true, FullMode = BoundedChannelFullMode.Wait });
+            Channel<Packet> receiveChannel = Channel.CreateUnbounded<Packet>();
+
+            Stopwatch sw = new();
+            sw.Start();
+            try
+            {
+                if (partName.Contains("runtimenv"))
+                { ErasePartition(partName); return; }
+                if (partName.Contains("calinv")) return;
+                if (partName.Contains("fixnv1"))
+                {
+                    WritePartition(partName, data);
+                    return;
+                }
+                Log?.Invoke($"Start writing {partName} partition");
+                var temp = handler.SendPacketAndReceive(BSL_CMD_START_DATA, CreateSelectPartitionRequest(partName, dataLength)).Type;
+                if (temp != BSL_REP_ACK) throw new UnexpectedResponseException(temp);
+
+                sendAndReceiveTask = handler.SendPacketsAndReceiveAsync(
+                    receiveChannel.Writer,
+                    sendChannel.Reader,
+                    token
+                    );
+
+                var checksum = SprdChecksum.Instance;
+
+                sendTask = Task.Run(async () =>
+                {
+                    for (ulong i = 0; i < dataLength;)
+                    {
+                        data.Position = (long)i;
+                        token.ThrowIfCancellationRequested();
+                        ushort nowReadSize = (ushort)Math.Min(dataLength - i, blocksize);
+                        byte[] block = new byte[nowReadSize];
+                        data.ReadExactly(block, 0, block.Length);
+                        await sendChannel.Writer.WriteAsync(new Packet(BSL_CMD_MIDST_DATA, block, checksum), token);
+                        i += nowReadSize;
+                    }
+                    sendChannel.Writer.Complete();
+                });
+
+                int packetCounts = 0;
+                int expectedPacketsCounts = (int)Math.Ceiling((double)dataLength / blocksize);
+
+                await foreach (var packet in receiveChannel.Reader.ReadAllAsync(token))
+                {
+                    if (packet.Type != BSL_REP_ACK)
+                        throw new UnexpectedResponseException(packet.Type);
+                    UpdatePercentage?.Invoke(
+                        packetCounts == expectedPacketsCounts ? (int)Percentage : (int)((long)++packetCounts * blocksize / (double)dataLength * Percentage)
+                        );
+                    nowBytes += blocksize;
+                    if (packetCounts >= expectedPacketsCounts)
+                        break;
+
+                }
+            }
+            finally
+            {
+
+                sw.Stop();
+                cts.Cancel();
+                cts.Dispose();
+                try
+                {
+                    await StatusMonitor;
+                }
+                catch (OperationCanceledException)
+                {
+
+                }
+                handler.SendPacketAndReceive(BSL_CMD_END_DATA);
+
+                if (sendAndReceiveTask != null)
+                    try
+                    {
+                        await sendAndReceiveTask;
+                    }
+                    catch (OperationCanceledException)
+                    {
+
+                    }
+                if (sendTask != null)
+                    try
+                    {
+                        await sendTask;
+                    }
+                    catch (OperationCanceledException)
+                    {
+
+                    }
+                Log?.Invoke($"{partName} partition write complete");
+                Log?.Invoke($"Elapsed time{sw.Elapsed:g}");
+            }
+        }
+        public async Task WritePartitionWithoutVerifyAsync(string partName, List<Partition> partitions, Stream data, CancellationToken token)
+        {
+            if (partName == "splloader" || partName == "ubipac" || partName == "sml") return;
+            const string forceName = "skip_verify";
+
+            List<Partition> temp = partitions.ToList();
+
+            int index = temp.FindIndex(p => p.Name == partName);
+
+            if (index < 0)
+            {
+                Log?.Invoke($" Partition {partName} does not exist, cannot write");
+                return;
+            }
+
+            var updatedPartition = temp[index];
+            updatedPartition.Name = forceName;
+            temp[index] = updatedPartition;
+
+            try
+            {
+                Repartition(temp);
+                bool a = CheckPartitionExist(forceName);
+                await WritePartitionAsync(forceName, data, token);
+            }
+            finally
+            {
+                Repartition(partitions);
+            }
+        }
+        public void WritePartitionWithoutVerify(string partName, List<Partition> partitionListWithoutSplloader, byte[] data, ulong offset = 0)
+        {
+            using var ms = new MemoryStream(data);
+            WritePartitionWithoutVerify(partName, partitionListWithoutSplloader, ms, offset);
+        }
+        public void WritePartitionWithoutVerify(string partName, List<Partition> partitionListWithoutSplloader, Stream data, ulong offset = 0)
+        {
+            const string forceName = "skip_verify";
+
+            List<Partition> temp = partitionListWithoutSplloader.ToList();
+
+            int index = temp.FindIndex(p => p.Name == partName);
+
+            if (index < 0)
+            {
+                Log?.Invoke($" Partition {partName} does not exist, cannot write");
+                return;
+            }
+
+            var updatedPartition = temp[index];
+            updatedPartition.Name = forceName;
+            temp[index] = updatedPartition;
+
+            Repartition(temp);
+
+            if (offset == 0)
+                WritePartition(forceName, data);
+            else
+                WritePartition(forceName, data, offset);
+
+            Repartition(partitionListWithoutSplloader);
+        }
+        #endregion
+        #region Reading partition
+        byte[] CreateReadPartitionRequest(uint nowReadSize, ulong nowReadOffset, bool useMode64)
+        {
+            byte[] result = new byte[useMode64 ? 12 : 8];
+            CreateReadPartitionRequest(result, nowReadSize, nowReadOffset, useMode64);
+            return result;
+        }
+        void CreateReadPartitionRequest(Memory<byte> buffer, uint nowReadSize, ulong nowReadOffset, bool use64Mode)
+        {
+            if (buffer.Length < 8) throw new ArgumentException();
+            if (use64Mode && buffer.Length < 12) throw new ArgumentException();
+            BinaryPrimitives.WriteUInt32LittleEndian(buffer.Span, nowReadSize);
+            BinaryPrimitives.WriteUInt32LittleEndian(buffer.Span.Slice(4), (uint)(nowReadOffset & 0xffffffff));
+            if (use64Mode) BinaryPrimitives.WriteUInt32LittleEndian(buffer.Span.Slice(8), (uint)(nowReadOffset >> 32));
+        }
+        public void ReadPartitionCustomize(Stream partDataStream, string partName, ulong size, ulong offset = 0)
+        {
+            if (!CheckPartitionExist(partName)) return;
+            if (partName == "splloader" || partName == "ubipac" || partName == "uboot" || partName == "sml" | partName == "trustos")
+                PerBlockSize = 0x1000;
+            if (partName.Contains("fixnv1")) partName = partName.Replace('1', '2');
+            ushort originBlockSize = PerBlockSize;
+            bool useMode64 = size >> 32 != 0;
+            Packet readPacket = handler.SendPacketAndReceive(BSL_CMD_READ_START, CreateSelectPartitionRequest(partName, (uint)size));
+            CancellationTokenSource cts = new CancellationTokenSource();
+            try
+            {
+
+                if (readPacket.Type != BSL_REP_ACK)
+                    throw new UnexpectedResponseException(readPacket.Type);
+                Log?.Invoke($"Start reading {partName} partition");
+                StartStatusMonitor(500, size, cts.Token);
+                byte[] tempData = new byte[useMode64 ? 12 : 8];
+                for (ulong nowOffset = offset; nowOffset < size;)
+                {
+                    uint nowReadSize = (uint)Math.Min(size - nowOffset, PerBlockSize);
+                    CreateReadPartitionRequest(tempData, nowReadSize, nowOffset, useMode64);
+                    readPacket = handler.SendPacketAndReceive(BSL_CMD_READ_MIDST, tempData);
+                    nowBytes += nowReadSize;
+                    if (readPacket.Type != BSL_REP_READ_FLASH) throw new UnexpectedResponseException(readPacket.Type);
+                    partDataStream.WriteAsync(readPacket.Data, 0, readPacket.Data.Length);
+                    nowOffset += nowReadSize;
+                    UpdatePercentage?.Invoke((int)(nowOffset / (float)size * Percentage));
+                }
+            }
+            finally
+            {
+                cts.Cancel();
+                cts.Dispose();
+                PerBlockSize = originBlockSize;
+                readPacket = handler.SendPacketAndReceive(BSL_CMD_READ_END);
+                if (readPacket.Type != BSL_REP_ACK) throw new UnexpectedResponseException(readPacket.Type);
+                Log?.Invoke($"{partName} partition read complete");
+            }
+        }
+        public async Task ReadPartitionCustomizeAsync(Stream partDataStream, string partName, ulong size, CancellationToken ct, ulong offset = 0)
+        {
+            if (!CheckPartitionExist(partName))
+                return;
+
+            bool useMode64 = size >> 32 != 0;
+            ushort originBlockSize = PerBlockSize;
+            if (partName == "splloader" || partName == "ubipac" ||
+                partName == "uboot" || partName == "sml" ||
+                partName == "trustos")
+            {
+                PerBlockSize = 0x1000;
+            }
+            if (partName.Contains("fixnv1"))
+                partName = partName.Replace('1', '2');
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            ct = cts.Token;
+            var statusMonitor = StartStatusMonitor(500, size, ct);
+            var sendChannel = Channel.CreateBounded<Packet>(new BoundedChannelOptions(20) { FullMode = BoundedChannelFullMode.Wait, SingleReader = true, SingleWriter = false });
+            var receiveChannel = Channel.CreateUnbounded<Packet>();
+            Task? sendReadPacketsTask = null;
+            Task? sendAndReceiveTask = null;
+            Stopwatch sw = new();
+            sw.Start();
+            try
+            {
+
+
+                var ack = handler.SendPacketAndReceive(BSL_CMD_READ_START, CreateSelectPartitionRequest(partName, size + offset));
+                if (ack.Type != BSL_REP_ACK)
+                    throw new UnexpectedResponseException(ack.Type);
+                Log?.Invoke($"Start reading {partName} partition (SPRDClientCore multi-thread high-speed reading)");
+                sendAndReceiveTask = handler.SendPacketsAndReceiveAsync(
+    receiveChannel.Writer,
+    sendChannel.Reader,
+    cts.Token
+);
+                IChecksum checksum = SprdChecksum.Instance;
+
+                sendReadPacketsTask = Task.Run(async () =>
+                {
+                    for (ulong i = offset; i < size + offset;)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        uint nowReadSize = (uint)Math.Min(PerBlockSize, size + offset - i);
+                        await sendChannel.Writer.WriteAsync(new Packet(BSL_CMD_READ_MIDST, CreateReadPartitionRequest(nowReadSize, i, useMode64), checksum), ct);
+                        i += nowReadSize;
+                    }
+                    sendChannel.Writer.Complete();
+                }, ct);
+                {
+                    int bytesToWrite;
+                    await foreach (var packet in receiveChannel.Reader.ReadAllAsync(ct))
+                    {
+                        if (packet.Type != BSL_REP_READ_FLASH)
+                            throw new UnexpectedResponseException(packet.Type);
+                        bytesToWrite = (int)Math.Min((ulong)packet.Data.Length, size - (ulong)nowBytes);
+                        partDataStream.Write(packet.Data, 0, bytesToWrite);
+                        nowBytes += bytesToWrite;
+                        UpdatePercentage?.Invoke((int)(nowBytes / (float)size * Percentage));
+                        if ((ulong)nowBytes >= size)
+                            break;
+                    }
+                }
+                if (ct.IsCancellationRequested)
+                    UpdatePercentage?.Invoke(0);
+            }
+            finally
+            {
+                sw.Stop();
+                cts.Cancel();
+                cts.Dispose();
+
+                try
+                {
+                    await statusMonitor;
+                }
+                catch (OperationCanceledException) { }
+
+                if (sendReadPacketsTask != null)
+                    try
+                    {
+                        await sendReadPacketsTask;
+                    }
+                    catch (OperationCanceledException) { }
+                if (sendAndReceiveTask != null)
+                    try
+                    {
+
+                        await sendAndReceiveTask;
+                    }
+                    catch (OperationCanceledException) { }
+
+                handler.SendPacketAndReceive(BSL_CMD_READ_END);
+                PerBlockSize = originBlockSize;
+                Log?.Invoke($"Elapsed time{sw.Elapsed.ToString("g")}");
+                Log?.Invoke($"Read partition {partName} complete, size: {size}, offset: {offset}");
+            }
+
+        }
+        #endregion
+        public void ErasePartition(string partName, int timeout = 40000)
+        {
+            int originTimeout = handler.Timeout;
+            handler.Timeout = timeout;
+            if (handler.SendPacketAndReceive(BSL_CMD_ERASE_FLASH, CreateSelectPartitionRequest(partName, 0)).Type != BSL_REP_ACK)
+                Log?.Invoke($"Erase partition {partName} failed");
+            else Log?.Invoke($"Partition {partName} erased");
+            handler.Timeout = originTimeout;
+        }
+        public ulong GetPartitionSize(string partName)
+        {
+            if (partName.Contains("nv1") || partName.Contains("nv2"))
+            {
+                partName = partName.Replace('1', '2');
+                Packet packet = handler.SendPacketAndReceive(BSL_CMD_READ_START, CreateSelectPartitionRequest(partName, 8));
+
+                if (packet.Type != BSL_REP_ACK) throw new UnexpectedResponseException(packet.Type);
+
+                uint[] tempData = { 8, 0 };
+                byte[] data = new byte[tempData.Length * sizeof(uint)];
+                Buffer.BlockCopy(tempData, 0, data, 0, data.Length);
+                packet = handler.SendPacketAndReceive(BSL_CMD_READ_MIDST, data);
+                if (packet.Type != BSL_REP_READ_FLASH) throw new UnexpectedResponseException(packet.Type);
+                handler.SendPacketAndReceive(BSL_CMD_READ_END);
+                uint _temp = BinaryPrimitives.ReadUInt32LittleEndian(packet.Data.AsSpan());
+                if (_temp != 0x00004e56)
+                    throw new BadPacketException("Invalid response");
+                return BinaryPrimitives.ReadUInt32LittleEndian(packet.Data.AsSpan(4));
+            }
+            int end = 20;
+            ulong offset = 0;
+            bool incrementing = true;
+            var temp = handler.SendPacketAndReceive(BSL_CMD_READ_START, CreateSelectPartitionRequest(partName, 0xffffffff)).Type;
+            bool nandMode = false;
+            if (temp != BSL_REP_ACK)
+                nandMode = true;
+            if (nandMode)
+            {
+                handler.SendPacketAndReceive(BSL_CMD_READ_END);
+                bool validNandSize(string partName, int validSize)
+                {
+                    SprdCommand ret = handler.SendPacketAndReceive(BSL_CMD_READ_START, CreateSelectPartitionRequest(partName, (ulong)validSize * 128UL * 1024UL)).Type;
+                    handler.SendPacketAndReceive(BSL_CMD_READ_END);
+                    return ret == BSL_REP_ACK;
+                }
+                ;
+                int low = 1, high = 1;
+                while (validNandSize(partName, high))
+                {
+                    low = high;
+                    high *= 2;
+                }
+                int i_min = high;
+                while (low <= high)
+                {
+                    int mid = low + (high - low) / 2;
+                    if (validNandSize(partName, mid))
+                    {
+                        low = mid + 1;
+                    }
+                    else
+                    {
+                        i_min = mid;
+                        high = mid - 1;
+                    }
+                }
+                offset = (ulong)(i_min - 1) * 128 * 1024;
+            }
+            else
+            {
+                byte[] data = new byte[3 * sizeof(uint)];
+                for (int i = end; i >= end;)
+                {
+                    ulong trial = offset + (1UL << i) - (1UL << end);
+                    uint low = (uint)trial;
+                    uint high = (uint)(trial >> 32);
+                    Buffer.BlockCopy(new uint[] { 4, low, high }, 0, data, 0, data.Length);
+
+                    var resp = handler.SendPacketAndReceive(BSL_CMD_READ_MIDST, data).Type;
+
+                    if (incrementing)
+                    {
+                        if (resp != BSL_REP_READ_FLASH)
+                        {
+                            if (trial == 0) break;
+                            offset += 1UL << i - 1;
+                            i -= 2;
+                            incrementing = false;
+                        }
+                        else
+                        {
+                            i = i == 10 ? i + 11 : i + 1;
+                        }
+                    }
+                    else
+                    {
+                        if (resp == BSL_REP_READ_FLASH)
+                            offset += 1UL << i;
+                        i--;
+                    }
+                }
+                handler.SendPacketAndReceive(BSL_CMD_READ_END);
+            }
+            Log?.Invoke($"{partName} partition size: {offset >> 20}MB");
+            return offset;
+        }
+        public (List<Partition> partitions, GetPartitionsMethod finalMethod) GetPartitionsAndStorageInfo(GetPartitionsMethod method = GetPartitionsMethod.ConvertExtTable, Action<string>? SpecifiedLog = null, Func<Task<bool>>? CheckConfirm = null)
+        {
+            List<Partition> partList = new List<Partition>();
+            if (CheckPartitionExist("ubipac"))
+            {
+                Log?.Invoke("Device detected as NAND model");
+                SpecifiedLog?.Invoke("Device detected as NAND model");
+                method = GetPartitionsMethod.TraverseCommonPartitions;
+            }
+            switch (method)
+            {
+                default: throw new ArgumentException();
+                case GetPartitionsMethod.ConvertExtTable:
+                    if (!CheckPartitionExist("user_partition"))
+                    {
+                        if (CheckConfirm != null)
+                            if (!CheckConfirm.Invoke().Result)
+                                goto case GetPartitionsMethod.SendReadPartitionPacket;
+                            else
+                                goto case GetPartitionsMethod.TraverseCommonPartitions;
+
+                        goto case GetPartitionsMethod.SendReadPartitionPacket;
+                    }
+                    Log?.Invoke("Attempting method 1 to get partition table");
+                    SpecifiedLog?.Invoke("Attempting method 1 to get partition table");
+                    using (MemoryStream? ms = new MemoryStream())
+                    {
+                        ReadPartitionCustomize(ms, "user_partition", 32 * 1024);
+                        if (ms != null)
+                        {
+                            EfiTableUtils efiTableUtils = new EfiTableUtils();
+                            var tmp = efiTableUtils.GetPartitions(ms);
+                            tmp.partitions.Insert(0, new Partition() { Name = "splloader", Size = GetPartitionSize("splloader"), IndicesToMB = 20 });
+                            return (tmp.partitions, GetPartitionsMethod.ConvertExtTable);
+                        }
+                        else
+                        {
+                            Log?.Invoke("Method 1 failed");
+                            SpecifiedLog?.Invoke("Method 1 failed");
+                            goto case GetPartitionsMethod.SendReadPartitionPacket;
+                        }
+                    }
+                case GetPartitionsMethod.SendReadPartitionPacket:
+                    Log?.Invoke("Attempting method 2 to get partition table");
+                    SpecifiedLog?.Invoke("Attempting method 2 to get partition table");
+                    partList.Clear();
+                    Packet packet = handler.SendPacketAndReceive(BSL_CMD_READ_PARTITION);
+                    if (packet.Type == BSL_REP_READ_PARTITION)
+                    {
+                        byte[] partNameBytes = new byte[36 * sizeof(char)],
+                            partSizeBytes = new byte[sizeof(uint)];
+                        int indices = 10; // 1024
+                        int partCount = packet.Data.Length / (partNameBytes.Length + partSizeBytes.Length);
+                        for (int i = 0; i < packet.Data.Length; i += partNameBytes.Length + partSizeBytes.Length)
+                        {
+                            while (BinaryPrimitives.ReadUInt32LittleEndian(packet.Data.AsSpan(i + partNameBytes.Length, partSizeBytes.Length)) >> indices == 0)
+                                indices--;
+                        }
+                        partList.Add(new Partition() { Name = "splloader", Size = GetPartitionSize("splloader"), IndicesToMB = 20 });
+                        for (int i = 0; i < packet.Data.Length; i += partNameBytes.Length + partSizeBytes.Length)
+                        {
+                            partList.Add(new Partition
+                            {
+                                Name = Encoding.Unicode.GetString(packet.Data, i, partNameBytes.Length),
+                                Size = BinaryPrimitives.ReadUInt32LittleEndian(packet.Data.AsSpan(i + partNameBytes.Length, partSizeBytes.Length)),
+                                IndicesToMB = indices
+                            });
+
+                        }
+                        return (partList, GetPartitionsMethod.SendReadPartitionPacket);
+                    }
+                    else
+                    {
+                        Log?.Invoke($"Method 2 failed: {packet.Type.ToString()}");
+                        SpecifiedLog?.Invoke($"Method 2 failed: {packet.Type.ToString()}");
+                        goto case GetPartitionsMethod.TraverseCommonPartitions;
+                    }
+                case GetPartitionsMethod.TraverseCommonPartitions:
+                    Log?.Invoke("Using compatibility method to get partition table");
+                    SpecifiedLog?.Invoke("Using compatibility method to get partition table");
+                    partList.Clear();
+                    foreach (string partName in Partition.CommonPartitions)
+                    {
+                        if (CheckPartitionExist(partName))
+                        {
+                            partList.Add(new Partition { Name = partName, Size = GetPartitionSize(partName), IndicesToMB = 20 });
+                        }
+                    }
+                    return (partList, GetPartitionsMethod.TraverseCommonPartitions);
+            }
+        }
+        public void Repartition(List<Partition> partitions)
+        {
+            if (partitions[0].Name == "splloader") partitions.RemoveAt(0);
+            byte[] repartitionData = new byte[partitions.Count * (36 * sizeof(char) + sizeof(uint))];
+            int i = 0;
+            foreach (Partition partition in partitions)
+            {
+                if (partition.Name.Length > 35)
+                {
+                    Log?.Invoke($" Partition {partition.Name} name too long, cannot re-partition");
+                    continue;
+                }
+
+                CreateSelectPartitionRequest(repartitionData.AsMemory(i), partition.Name, partition.Name == "userdata" ? 0xffffffff : partition.Size >> partition.IndicesToMB);
+                i += 36 * sizeof(char) + sizeof(uint);
+            }
+            var a = handler.SendPacketAndReceive(BSL_CMD_REPARTITION, repartitionData).Type;
+            if (a != BSL_REP_ACK)
+            {
+                throw new UnexpectedResponseException(a);
+            }
+        }
+        private byte[] CreateSelectPartitionRequest(string partName,
+                                                    ulong size,
+                                                    IChecksum? checksum = null)
+        {
+            bool useMode64 = size >> 32 != 0;
+            byte[] result = new byte[useMode64 ? 80 : 76];
+            CreateSelectPartitionRequest(result, partName, size, checksum);
+            return result;
+        }
+        private void CreateSelectPartitionRequest(Memory<byte> partData, string partName, ulong size, IChecksum? checksum = null)
+        {
+            bool useMode64 = size >> 32 != 0;
+            if (partData.Length < 76) throw new ArgumentException();
+            if (useMode64 && partData.Length < 80) throw new ArgumentException();
+            Encoding.Unicode.GetBytes(partName).CopyTo(partData.Span.Slice(0, 72));
+            BinaryPrimitives.WriteUInt32LittleEndian(partData.Span.Slice(72, 4), (uint)size);
+            if (useMode64) BinaryPrimitives.WriteUInt32LittleEndian(partData.Span.Slice(76, 4), (uint)(size >> 32));
+        }
+
+
+        public bool SendAndCheck(SprdCommand sendType, SprdCommand expectedType = BSL_REP_ACK)
+        {
+            Packet res = handler.SendPacketAndReceive(sendType);
+            if (res.Type == BSL_REP_VERIFY_ERROR)
+            {
+                handler.UseCrc = !handler.UseCrc;
+                res = handler.SendPacketAndReceive(sendType);
+            }
+            return res.Type == expectedType;
+        }
+        public DaInfo? ExecuteDataAndConnect(Stages stage, bool isAfterSendingExecAddr = false)
+        {
+            switch (stage)
+            {
+                default: throw new ArgumentException();
+                case Stages.Brom:
+                    if (!isAfterSendingExecAddr)
+                        SendAndCheck(BSL_CMD_EXEC_DATA);
+                    Log?.Invoke("fdl1 executed");
+                    handler.UseCrc = false;
+                    SendAndCheck(BSL_CMD_CHECK_BAUD);
+                    SendAndCheck(BSL_CMD_CONNECT);
+                    Log?.Invoke("Handshaked with fdl1");
+                    SendAndCheck(BSL_CMD_KEEP_CHARGE);
+                    Log?.Invoke("Attempted to keep charging state");
+                    return null;
+                case Stages.Fdl1:
+                    DaInfo temp = GetDaInfo(handler.SendPacketAndReceive(BSL_CMD_EXEC_DATA).Data);
+                    Log?.Invoke("fdl2 executed and handshaked");
+                    SendAndCheck(BSL_CMD_DISABLE_TRANSCODE);
+                    Log?.Invoke("Attempted to cancel 0x7d encoding");
+                    handler.Transcode = false;
+                    return temp;
+            }
+        }
+        public static DaInfo GetDaInfo(byte[] data)
+        {
+            var daInfo = new DaInfo();
+
+            if (data.Length > 6)
+            {
+                if (data.Length >= 4 &&
+                    BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(0, 4)) == 0x7477656E)
+                {
+                    int len = 4;
+                    while (len + 4 <= data.Length) // Ensure Type and Length can be read
+                    {
+                        ushort type = BinaryPrimitives.ReadUInt16LittleEndian(data.AsSpan(len, 2));
+                        ushort length = BinaryPrimitives.ReadUInt16LittleEndian(data.AsSpan(len + 2, 2));
+                        len += 4; // Moved past Type and Length
+
+                        // Handle Value based on Type, and skip Length bytes
+                        switch (type)
+                        {
+                            case 0: // bDisableHDLC (uint)
+                                if (len + 4 <= data.Length)
+                                    daInfo.bDisableHDLC = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(len, 4));
+                                len += length; // Skip Length bytes
+                                break;
+                            case 2: // bSupportRawData (byte)
+                                if (len < data.Length)
+                                    daInfo.bSupportRawData = data[len];
+                                len += length;
+                                break;
+                            case 3: // dwFlushSize (uint)
+                                if (len + 4 <= data.Length)
+                                    daInfo.dwFlushSize = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(len, 4));
+                                len += length;
+                                break;
+                            case 6: // dwStorageType (uint)
+                                if (len + 4 <= data.Length)
+                                    daInfo.dwStorageType = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(len, 4));
+                                len += length;
+                                break;
+                            default:
+                                len += length; // Skip Value of unknown type
+                                break;
+                        }
+                    }
+                }
+                else
+                {
+                    int offset = 0;
+                    if (offset + 4 <= data.Length)
+                    {
+                        daInfo.dwVersion = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(offset, 4));
+                        offset += 4;
+                    }
+                    if (offset + 4 <= data.Length)
+                    {
+                        daInfo.bDisableHDLC = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(offset, 4));
+                        offset += 4;
+                    }
+                    if (offset < data.Length)
+                    {
+                        daInfo.bIsOldMemory = data[offset++];
+                    }
+                    if (offset < data.Length)
+                    {
+                        daInfo.bSupportRawData = data[offset++];
+                    }
+                    // Reserved bReserve[2]
+                    if (offset + 2 <= data.Length)
+                    {
+                        daInfo.bReserve = new byte[2] { data[offset], data[offset + 1] };
+                        offset += 2;
+                    }
+                    if (offset + 4 <= data.Length)
+                    {
+                        daInfo.dwFlushSize = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(offset, 4));
+                        offset += 4;
+                    }
+                    if (offset + 4 <= data.Length)
+                    {
+                        daInfo.dwStorageType = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(offset, 4));
+                        offset += 4;
+                    }
+                    // Reserved dwReserve[59]
+                    daInfo.dwReserve = new uint[59];
+                    for (int i = 0; i < 59 && offset + 4 <= data.Length; i++, offset += 4)
+                        daInfo.dwReserve[i] = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(offset, 4));
+                }
+            }
+
+            return daInfo;
+        }
+        private static byte[] StructToBytes<T>(T obj, int size) where T : struct
+        {
+            //int size = Marshal.SizeOf(obj);
+            byte[] bytes = new byte[size];
+            nint ptr = Marshal.AllocHGlobal(size);
+            try
+            {
+                Marshal.StructureToPtr(obj, ptr, false);
+                Marshal.Copy(ptr, bytes, 0, size);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(ptr);
+            }
+            return bytes;
+        }
+        public static ulong StringToSize(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s))
+                return 0;
+            s = s.Trim();
+            if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            {
+                string hexPart = s.Substring(2);
+                if (uint.TryParse(hexPart, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out uint hexValue))
+                    return hexValue;
+                throw new ArgumentException($"Unable to parse hexadecimal number: {s}", nameof(s));
+            }
+
+            var units = new Dictionary<string, ulong>(StringComparer.OrdinalIgnoreCase)
+    {
+        { "B", 1UL },
+        { "",  1UL },
+        { "K", 1024UL },
+        { "KB", 1024UL },
+        { "M", 1024UL * 1024 },
+        { "MB", 1024UL * 1024 },
+        { "G", 1024UL * 1024 * 1024 },
+        { "GB", 1024UL * 1024 * 1024 },
+        { "T", 1024UL * 1024 * 1024 * 1024 },
+        { "TB", 1024UL * 1024 * 1024 * 1024 },
+    };
+
+            var match = Regex.Match(s, @"^(?<num>\d+)(?<unit>[a-zA-Z]{0,2})$");
+            if (!match.Success)
+                throw new ArgumentException($"Invalid format: {s}", nameof(s));
+
+            string numPart = match.Groups["num"].Value;
+            string unitPart = match.Groups["unit"].Value.ToUpperInvariant();
+
+            if (!ulong.TryParse(numPart, out ulong number))
+                throw new ArgumentException($"Unable to parse numeric part: {numPart}", nameof(s));
+            if (!units.TryGetValue(unitPart, out ulong multiplier))
+                throw new ArgumentException($"Unsupported unit: {unitPart}", nameof(s));
+
+            ulong result = number * multiplier;
+            if (result > ulong.MaxValue)
+                throw new OverflowException($"Result exceeds maximum value: {result}");
+
+            return result;
+        }
+        public static void SavePartitionsToXml(List<Partition> partitions, Stream stream)
+        {
+            if (partitions[0].Name == "splloader") partitions.RemoveAt(0);
+            var doc = new XDocument(
+                new XElement("Partitions",
+                    partitions.Select(p =>
+                        new XElement("Partition",
+                            new XAttribute("id", p.Name),
+                            new XAttribute("size", p.Name == "userdata" ? "0xFFFFFFFF" : Math.Ceiling(p.Size / (double)(1 << p.IndicesToMB)))
+                        )
+                    )
+                )
+            );
+
+            doc.Save(stream);
+        }
+        public static List<Partition> LoadPartitionsXml(string xmlContent)
+        {
+            Func<string, ulong> ParseSize = (sizeString) =>
+            {
+                if (sizeString.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                {
+                    return Convert.ToUInt64(sizeString.Substring(2), 16);
+                }
+                return Convert.ToUInt64(sizeString);
+            };
+            var partitions = new List<Partition>();
+            var doc = XDocument.Parse(xmlContent);
+
+            var nodes = doc.XPathSelectElements("//Partitions/Partition");
+
+            foreach (var node in nodes)
+            {
+                var nameAttr = node.Attribute("id");
+                var sizeAttr = node.Attribute("size");
+
+                if (nameAttr == null || sizeAttr == null) continue;
+
+                try
+                {
+                    var partition = new Partition
+                    {
+                        Name = nameAttr.Value,
+                        Size = ParseSize(sizeAttr.Value),
+                        IndicesToMB = 0
+                    };
+                    partitions.Add(partition);
+                }
+                catch (FormatException)
+                {
+                }
+            }
+
+            return partitions;
+        }
+    }
+}

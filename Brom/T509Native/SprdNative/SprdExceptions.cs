@@ -1,0 +1,31 @@
+﻿namespace SPRDClientCore.Models
+{
+    public static class SprdExceptions
+    {
+        public class SprdException : Exception
+        {
+            public SprdException() : base() { }
+            public SprdException(string message) : base(message) { }
+        }
+
+        public class UnexpectedResponseException : SprdException
+        {
+            public UnexpectedResponseException(SprdCommand sprdCommand) : base($"Packet response exception type : {sprdCommand}") { }
+        }
+
+        public class ResponseTimeoutReachedException : SprdException
+        {
+            public ResponseTimeoutReachedException(string message) : base(message) { }
+        }
+
+        public class BadPacketException : SprdException
+        {
+            public BadPacketException(string message) : base(message) { }
+        }
+
+        public class ChecksumFailedException : SprdException
+        {
+            public ChecksumFailedException(string message) : base(message) { }
+        }
+    }
+}

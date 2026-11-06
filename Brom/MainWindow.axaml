@@ -1,0 +1,58 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Brom.MainWindow"
+        Title="Brom"
+        Width="1280" Height="760"
+        MinWidth="1080" MinHeight="640"
+        WindowStartupLocation="CenterScreen"
+        Background="#0A0A0C">
+    <Window.Styles>
+        <Style Selector="Button">
+            <Setter Property="Background" Value="#1A1B20"/>
+            <Setter Property="Foreground" Value="#EBEEF5"/>
+            <Setter Property="BorderBrush" Value="#242834"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Padding" Value="12,8"/>
+            <Setter Property="HorizontalContentAlignment" Value="Left"/>
+            <Setter Property="CornerRadius" Value="6"/>
+            <Setter Property="Cursor" Value="Hand"/>
+        </Style>
+        <Style Selector="Button:pointerover">
+            <Setter Property="Background" Value="#242834"/>
+        </Style>
+        <Style Selector="Button:pressed">
+            <Setter Property="Background" Value="#2E3340"/>
+        </Style>
+        <Style Selector="ComboBox">
+            <Setter Property="Background" Value="#14151A"/>
+            <Setter Property="Foreground" Value="#EBEEF5"/>
+            <Setter Property="BorderBrush" Value="#242834"/>
+        </Style>
+    </Window.Styles>
+    <Grid ColumnDefinitions="470,*" RowDefinitions="Auto,*">
+        <!-- Header -->
+        <Border Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="2" Background="#08090B" Padding="16,10">
+            <Grid ColumnDefinitions="*,Auto">
+                <TextBlock Text="Brom" FontSize="20" FontWeight="Bold" Foreground="#EBEEF5" VerticalAlignment="Center"/>
+                <TextBlock Grid.Column="1" Text="T509 BROM Tool" Foreground="#6C788A" VerticalAlignment="Center"/>
+            </Grid>
+        </Border>
+        <!-- Left sidebar -->
+        <StackPanel Grid.Row="1" Grid.Column="0" Margin="12,8,8,12" Spacing="8">
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <TextBox x:Name="searchBox" Width="200" Watermark="Search port/device" />
+                <ComboBox x:Name="devicesComboBox" Width="200" />
+                <Button Content="↻" Width="44" Click="OnRefreshDevices" />
+            </StackPanel>
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+                <StackPanel x:Name="actionsPanel" Spacing="6" />
+            </ScrollViewer>
+        </StackPanel>
+        <!-- Log area -->
+        <Border Grid.Row="1" Grid.Column="1" Margin="8,8,12,12" Background="#0A0C10" CornerRadius="8" BorderBrush="#242834" BorderThickness="1">
+            <ScrollViewer x:Name="logScroll" VerticalScrollBarVisibility="Auto" Padding="10">
+                <StackPanel x:Name="logPanel" />
+            </ScrollViewer>
+        </Border>
+    </Grid>
+</Window>
